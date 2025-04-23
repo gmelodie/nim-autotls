@@ -4,6 +4,7 @@
 import std/[base64, options, os, strformat, osproc, random, strutils, json]
 import chronos, bio, jwt, jsony, nimcrypto, libp2p
 import chronos/apps/http/httpclient
+import bigints
 
 const
   LetsEncryptURL = "https://acme-staging-v02.api.letsencrypt.org"
@@ -23,6 +24,23 @@ type SigParam = object
 
 type RSAPrivateKey = object
   n, e, d, p, q, dmp1, dmq1, iqmp: seq[byte]
+
+const base36Chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+proc base36Encode(data: seq[byte]): string =
+  var number = 0.initBigInt
+  for b in data:
+    number = number shl 8
+    number = number or b.initBigInt
+  if number == 0:
+    return "0"
+  result = ""
+  let radix = 36.initBigInt
+  while number > 0:
+    let (quotient, remainder) = divMod(number, radix)
+    result = base36Chars[int(remainder)] & result
+    number = quotient
+
 
 proc base64UrlEncode(data: seq[byte]): string =
   ## Encodes data using base64url (RFC 4648 §5) — no padding, URL-safe
@@ -262,7 +280,7 @@ proc peerIdSign(
   result = base64UrlEncodeNoSuffix(privateKey.sign(bytesToSign).get().getBytes())
 
 proc peerIDAuth(
-    peerID: PeerId, privateKey: PrivateKey, pubKey: PublicKey, payload: JsonNode
+    peerID: string, privateKey: PrivateKey, pubKey: PublicKey, payload: JsonNode
 ): Future[string] {.async.} =
   let registrationURL = fmt"{AutoTLSBroker}/v1/_acme-challenge"
 
@@ -328,8 +346,11 @@ proc main() {.async: (raises: [Exception]).} =
     .build()
   await switch.start()
 
+  let base36PeerId = base36Encode(switch.peerInfo.peerId.data)
+  echo base36PeerId
+
   # this will be the domain we're issuing a certificate for
-  let domain = fmt"*.{switch.peerInfo.peerId}.{AutoTLSDNSServer}"
+  let domain = fmt"*.{base36PeerId}.{AutoTLSDNSServer}"
 
   # request challenge from CA
   let dns01Challenge = await account.requestChallenge(@[domain])
@@ -354,10 +375,12 @@ proc main() {.async: (raises: [Exception]).} =
   # authenticate as peerID with AutoTLS broker and send challenge
   # https://github.com/libp2p/specs/blob/master/http/peer-id-auth.md
   let bearerToken = await peerIDAuth(
-    switch.peerInfo.peerId, switch.peerInfo.privateKey, switch.peerInfo.publicKey,
+    base36PeerId, switch.peerInfo.privateKey, switch.peerInfo.publicKey,
     payload,
   )
   discard bearerToken
+
+  # check for TXT RR {peerId}.libp2p.direct (base36 encoded peerid)
 
   # echo fmt"trying to register with AutoTLS broker: (peerId: {wwwAuthenticate})"
 
