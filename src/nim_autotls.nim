@@ -2,9 +2,8 @@
 # nim c -d:ssl -r acme.nim
 
 import std/[base64, options, os, strformat, osproc, random, strutils, json]
-import chronos, bio, jwt, jsony, nimcrypto, libp2p
+import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
 import chronos/apps/http/httpclient
-import bigints
 
 const
   LetsEncryptURL = "https://acme-staging-v02.api.letsencrypt.org"
@@ -25,32 +24,15 @@ type SigParam = object
 type RSAPrivateKey = object
   n, e, d, p, q, dmp1, dmq1, iqmp: seq[byte]
 
-const base36Chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-proc base36Encode(data: seq[byte]): string =
-  var number = 0.initBigInt
-  for b in data:
-    number = number shl 8
-    number = number or b.initBigInt
-  if number == 0:
-    return "0"
-  result = ""
-  let radix = 36.initBigInt
-  while number > 0:
-    let (quotient, remainder) = divMod(number, radix)
-    result = base36Chars[int(remainder)] & result
-    number = quotient
-
-
 proc base64UrlEncode(data: seq[byte]): string =
   ## Encodes data using base64url (RFC 4648 §5) — no padding, URL-safe
-  result = encode(data, safe = true)
+  result = base64.encode(data, safe = true)
   result.removeSuffix("=")
   result.removeSuffix("=")
 
 proc base64UrlEncodeNoSuffix(data: seq[byte]): string =
   ## Encodes data using base64url (RFC 4648 §5) — no padding, URL-safe
-  result = encode(data, safe = true)
+  result = base64.encode(data, safe = true)
 
 proc genTempFilename(prefix: string, suffix: string): string =
   ## Generates a unique temporary file name with the given prefix and suffix.
@@ -323,6 +305,13 @@ proc peerIDAuth(
 
   result = extractField(resp.headers.getString("authentication-info"), "bearer")
 
+proc encodePeerId(peerId: PeerId): string =
+  var mh: MultiHash
+  discard MultiHash.decode(peerId.data, mh).get()
+  # cidv1 from multihash with libp2pkey codec
+  let cid = Cid.init(CIDv1, multiCodec("libp2p-key"), mh).get()
+  return Base36.encode(cid.data.buffer)
+
 proc main() {.async: (raises: [Exception]).} =
   # if key file does not exist, register account
   let keyFile = "/tmp/account.key"
@@ -346,7 +335,8 @@ proc main() {.async: (raises: [Exception]).} =
     .build()
   await switch.start()
 
-  let base36PeerId = base36Encode(switch.peerInfo.peerId.data)
+
+  let base36PeerId = encodePeerId(switch.peerInfo.peerId)
   echo base36PeerId
 
   # this will be the domain we're issuing a certificate for
