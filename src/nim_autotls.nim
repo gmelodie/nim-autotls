@@ -2,7 +2,8 @@
 # nim c -d:ssl -r acme.nim
 
 import std/[base64, options, os, strformat, osproc, random, strutils, json]
-import chronos, bio, httpclient, jwt, jsony, nimcrypto, libp2p
+import chronos, bio, jwt, jsony, nimcrypto, libp2p
+import chronos/apps/http/httpclient
 
 const
   LetsEncryptURL = "https://acme-staging-v02.api.letsencrypt.org"
@@ -10,7 +11,7 @@ const
   AutoTLSDNSServer = "libp2p.direct"
   Alg = "RS256"
 
-type Account = object
+type Account = ref object
   status*: string
   contact*: seq[string]
   privKey: string
@@ -105,16 +106,17 @@ proc generateRsaKey*(bits = 2048): string =
   writeFile("/tmp/domain.key", result)
   removeFile(tmpFile)
 
-proc getDirectory(): JsonNode =
-  let client = newHttpClient()
-  let directory = client.get(LetsEncryptURL & "/directory").body.parseJson()
+proc getDirectory(): Future[JsonNode] {.async.} =
+  let resp = await HttpClientRequestRef.get(HttpSessionRef.new(), LetsEncryptURL & "/directory").get().send()
+  let resp_body = bytesToString(await resp.getBodyBytes())
+  let directory = resp_body.parseJson()
   return directory
 
-proc getNewNonce(): string =
-  let client = newHttpClient()
-  let nonceURL = getDirectory()["newNonce"].getStr
-  let resp = client.request(nonceURL, httpMethod = HttpGet)
-  return resp.headers["replay-nonce"]
+proc getNewNonce(): Future[string] {.async.} =
+  let directory = await getDirectory()
+  let nonceURL = directory["newNonce"].getStr
+  let resp = await HttpClientRequestRef.get(HttpSessionRef.new(), nonceURL).get().send()
+  return resp.headers.getString("replay-nonce")
 
 proc getAcmeHeader(
     acc: Account,
@@ -123,11 +125,12 @@ proc getAcmeHeader(
     n: string = "",
     e: string = "",
     kid: string = "",
-): JsonNode =
+): Future[JsonNode] {.async.} =
   let key = loadRsaKey(acc.privKey)
   let n = base64UrlEncode(key.n)
   let e = base64UrlEncode(key.e)
-  var header = %*{"alg": Alg, "typ": "JWT", "nonce": getNewNonce(), "url": url}
+  let newNonce = await getNewNonce()
+  var header = %*{"alg": Alg, "typ": "JWT", "nonce": newNonce, "url": url}
   if needsJwk:
     header["jwk"] = %*{"kty": "RSA", "n": n, "e": e}
   else:
@@ -136,8 +139,9 @@ proc getAcmeHeader(
 
 proc makeSignedAcmeRequest(
     acc: Account, url: string, payload: JsonNode, needsJwk: bool = false
-): Response =
-  var token = toJWT(%*{"header": acc.getAcmeHeader(url, needsJwk), "claims": payload})
+): Future[HttpClientResponseRef] {.async.} =
+  let acmeHeader = await acc.getAcmeHeader(url, needsJwk)
+  var token = toJWT(%*{"header": acmeHeader, "claims": payload})
   token.sign(acc.privKey)
 
   let body =
@@ -147,30 +151,31 @@ proc makeSignedAcmeRequest(
       "signature": base64UrlEncode(token.signature),
     }
 
-  var client = newHttpClient()
-  let headers = newHttpHeaders({"Content-Type": "application/jose+json"})
-  client.request(url, httpMethod = HttpPost, body = $body, headers = headers)
+  return await HttpClientRequestRef.post(HttpSessionRef.new(), url, body = $body, headers = [("Content-Type", "application/jose+json")]).get().send()
 
-proc registerAccount(acc: var Account) {.raises: [Exception].} =
+
+proc registerAccount(acc: Account) {.async raises: [Exception].} =
   let registerAccountPayload = %*{"termsOfServiceAgreed": true}
-  let resp = acc.makeSignedAcmeRequest(
-    getDirectory()["newAccount"].getStr, registerAccountPayload, needsJwk = true
+  let directory = await getDirectory()
+  let resp = await acc.makeSignedAcmeRequest(
+    directory["newAccount"].getStr, registerAccountPayload, needsJwk = true
   )
-  var account = resp.body.fromJson(Account)
-  acc.kid = resp.headers["location"]
+  var account = bytesToString(await resp.getBodyBytes()).fromJson(Account)
+  acc.kid = resp.headers.getString("location")
   acc.status = account.status
   acc.contact = account.contact
 
-proc requestChallenge(acc: Account, domains: seq[string]): JsonNode =
+proc requestChallenge(acc: Account, domains: seq[string]): Future[JsonNode] {.async.} =
   var orderPayload = %*{"identifiers": []}
   for domain in domains:
     orderPayload["identifiers"].add(%*{"type": "dns", "value": domain})
-  let resp = acc.makeSignedAcmeRequest(getDirectory()["newOrder"].getStr, orderPayload)
+  let directory = await getDirectory()
+  let resp = await acc.makeSignedAcmeRequest(directory["newOrder"].getStr, orderPayload)
 
   # get challenges
-  let client = newHttpClient()
-  let authz_url = resp.body.parseJson()["authorizations"][0].getStr
-  let authz = client.get(authz_url).body.parseJson()
+  let authz_url = bytesToString(await resp.getBodyBytes()).parseJson()["authorizations"][0].getStr
+  let auth_resp = await HttpClientRequestRef.get(HttpSessionRef.new(), authz_url).get().send()
+  let authz = bytesToString(await auth_resp.getBodyBytes()).parseJson()
 
   let challenges = authz["challenges"]
 
@@ -185,6 +190,7 @@ proc requestChallenge(acc: Account, domains: seq[string]): JsonNode =
 
 proc newAccount(): Account =
   var account: Account
+  new(account)
   account.privKey = generateRsaKey()
   return account
 
@@ -257,13 +263,12 @@ proc peerIdSign(
 
 proc peerIDAuth(
     peerID: PeerId, privateKey: PrivateKey, pubKey: PublicKey, payload: JsonNode
-): string =
-  var client = newHttpClient()
+): Future[string] {.async.} =
   let registrationURL = fmt"{AutoTLSBroker}/v1/_acme-challenge"
 
-  let resp1 = client.request(registrationURL, httpMethod = HttpGet)
+  let resp1 = await HttpClientRequestRef.get(HttpSessionRef.new(), registrationURL).get().send()
 
-  let wwwAuthenticate = resp1.headers["www-authenticate"]
+  let wwwAuthenticate = resp1.headers.getString("www-authenticate")
 
   let challengeClient = extractField(wwwAuthenticate, "challenge-client")
   let serverPublicKey =
@@ -286,25 +291,19 @@ proc peerIDAuth(
   echo "3.AUTHORIZATION"
   echo authHeader
 
-  let resp = client.request(
-    registrationURL,
-    httpMethod = HttpPost,
-    body = $payload,
-    headers = newHttpHeaders(
-      {
-        "Content-Type": "application/json",
-        "User-Agent": "nim-libp2p",
-        "authorization": authHeader,
-      }
-    ),
-  )
+  let resp = await HttpClientRequestRef.post(HttpSessionRef.new(), registrationURL, body = $payload, headers = [
+      ("Content-Type", "application/json"),
+      ("User-Agent", "nim-libp2p"),
+      ("authorization", authHeader),
+    ],
+  ).get().send()
 
   echo "4.SERVER BEARER"
   echo resp.status
-  echo resp.body
+  echo bytesToString(await resp.getBodyBytes())
   echo resp.headers
 
-  result = extractField(resp.headers["authentication-info"], "bearer")
+  result = extractField(resp.headers.getString("authentication-info"), "bearer")
 
 proc main() {.async: (raises: [Exception]).} =
   # if key file does not exist, register account
@@ -314,7 +313,7 @@ proc main() {.async: (raises: [Exception]).} =
     account.privKey = readFile(keyFile)
   else:
     writeFile(keyFile, account.privKey)
-  account.registerAccount()
+  await account.registerAccount()
   # registering account with key already present returns account
 
   # start libp2p peer
@@ -333,7 +332,7 @@ proc main() {.async: (raises: [Exception]).} =
   let domain = fmt"*.{switch.peerInfo.peerId}.{AutoTLSDNSServer}"
 
   # request challenge from CA
-  let dns01Challenge = account.requestChallenge(@[domain])
+  let dns01Challenge = await account.requestChallenge(@[domain])
   echo fmt"challenge: {dns01Challenge}"
 
   let key = loadRsaKey(account.privKey)
@@ -354,7 +353,7 @@ proc main() {.async: (raises: [Exception]).} =
   echo "payload: ", $payload
   # authenticate as peerID with AutoTLS broker and send challenge
   # https://github.com/libp2p/specs/blob/master/http/peer-id-auth.md
-  let bearerToken = peerIDAuth(
+  let bearerToken = await peerIDAuth(
     switch.peerInfo.peerId, switch.peerInfo.privateKey, switch.peerInfo.publicKey,
     payload,
   )
