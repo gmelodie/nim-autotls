@@ -323,7 +323,7 @@ proc main() {.async: (raises: [Exception]).} =
     .withRng(rng)
     .withAddress(MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet())
     .withTcpTransport()
-    .withMplex()
+    .withYamux()
     .withNoise()
     .build()
   await switch.start()
