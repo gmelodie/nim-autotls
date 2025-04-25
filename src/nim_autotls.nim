@@ -1,8 +1,8 @@
 # run with:
 # nim c -d:ssl -r acme.nim
 
-import std/[base64, options, os, strformat, osproc, random, strutils, json]
-import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
+import std/[base64, options, os, strformat, osproc, random, strutils, json, net]
+import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36, ndns
 import chronos/apps/http/httpclient
 
 const
@@ -307,7 +307,9 @@ proc peerIDAuth(
 
 proc encodePeerId(peerId: PeerId): string =
   var mh: MultiHash
-  discard MultiHash.decode(peerId.data, mh).get()
+  if MultiHash.decode(peerId.data, mh).get() == -1:
+      echo "error! wrong multihash"
+      quit(1)
   # cidv1 from multihash with libp2pkey codec
   let cid = Cid.init(CIDv1, multiCodec("libp2p-key"), mh).get()
   return Base36.encode(cid.data.buffer)
@@ -340,7 +342,8 @@ proc main() {.async: (raises: [Exception]).} =
   echo base36PeerId
 
   # this will be the domain we're issuing a certificate for
-  let domain = fmt"*.{base36PeerId}.{AutoTLSDNSServer}"
+  let baseDomain = fmt"{base36PeerId}.{AutoTLSDNSServer}"
+  let domain = fmt"*.{baseDomain}"
 
   # request challenge from CA
   let dns01Challenge = await account.requestChallenge(@[domain])
@@ -371,12 +374,31 @@ proc main() {.async: (raises: [Exception]).} =
   discard bearerToken
 
   # check for TXT RR {peerId}.libp2p.direct (base36 encoded peerid)
+  let dashedIpAddr = ($getPrimaryIPAddr()).replace(".", "-")
+  echo dashedIpAddr
+  echo execCmdEx(fmt"dig TXT _acme-challenge.{baseDomain}")
+  echo execCmdEx(fmt"dig A {dashedIpAddr}.{baseDomain}")
+  echo ""
 
-  # echo fmt"trying to register with AutoTLS broker: (peerId: {wwwAuthenticate})"
+  # notify ACME server of challenge completion (signed req with empty payload)
+  let chalURL = dns01Challenge["url"].getStr
+  let emptyPayload = newJObject()
+  let completedResp = await account.makeSignedAcmeRequest(chalURL, emptyPayload)
+  let resp_body = bytesToString(await completedResp.getBodyBytes())
+  echo resp_body
+  let completedBody = resp_body.parseJson()
 
-  # "receive DNS added" msg from libp2p.direct DNS server
+  # check until acme server is done (poll validation)
+  let checkURL = completedBody["url"].getStr
+  var chalCompleted = false
+  while (not chalCompleted):
+    let checkResp = await HttpClientRequestRef.get(HttpSessionRef.new(), checkURL).get().send()
+    let checkBody = bytesToString(await checkResp.getBodyBytes())
+    let checkJson = checkBody.parseJson()
+    if checkJson["status"].getStr != "pending":
+        echo checkBody
+        chalCompleted = true
 
-  # notify ACME server of challenge completion
 
   # get certificate for domain
 
