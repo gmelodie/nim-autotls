@@ -2,7 +2,10 @@
 # nim c -d:ssl -r acme.nim
 
 import std/[base64, options, os, strformat, osproc, random, strutils, json, net]
-import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36, ndns
+import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
+import libp2p/transports/tls/certificate_ffi
+import libp2p/transports/tls/certificate
+import std/sysrand
 import chronos/apps/http/httpclient
 
 const
@@ -165,15 +168,19 @@ proc registerAccount(acc: Account) {.async raises: [Exception].} =
   acc.status = account.status
   acc.contact = account.contact
 
-proc requestChallenge(acc: Account, domains: seq[string]): Future[JsonNode] {.async.} =
+proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, string)] {.async.} =
   var orderPayload = %*{"identifiers": []}
   for domain in domains:
     orderPayload["identifiers"].add(%*{"type": "dns", "value": domain})
   let directory = await getDirectory()
   let resp = await acc.makeSignedAcmeRequest(directory["newOrder"].getStr, orderPayload)
 
+  let respBody = bytesToString(await resp.getBodyBytes()).parseJson()
+  echo respBody
+  let finalizeURL = respBody["finalize"].getStr
+
   # get challenges
-  let authz_url = bytesToString(await resp.getBodyBytes()).parseJson()["authorizations"][0].getStr
+  let authz_url = respBody["authorizations"][0].getStr
   let auth_resp = await HttpClientRequestRef.get(HttpSessionRef.new(), authz_url).get().send()
   let authz = bytesToString(await auth_resp.getBodyBytes()).parseJson()
 
@@ -186,7 +193,7 @@ proc requestChallenge(acc: Account, domains: seq[string]): Future[JsonNode] {.as
       break
 
   # TODO: error dns01 not found
-  return dns01
+  return (dns01, finalizeURL)
 
 proc newAccount(): Account =
   var account: Account
@@ -314,6 +321,13 @@ proc encodePeerId(peerId: PeerId): string =
   let cid = Cid.init(CIDv1, multiCodec("libp2p-key"), mh).get()
   return Base36.encode(cid.data.buffer)
 
+proc urandomToCString(len: int): cstring =
+  let randBytes = urandom(len)
+  result = cast[cstring](alloc(len + 1))  # +1 for null terminator
+  for i in 0..<len:
+    result[i] = char(randBytes[i])
+  result[len] = '\0'  # Null-terminate
+
 proc main() {.async: (raises: [Exception]).} =
   # if key file does not exist, register account
   let keyFile = "/tmp/account.key"
@@ -337,7 +351,6 @@ proc main() {.async: (raises: [Exception]).} =
     .build()
   await switch.start()
 
-
   let base36PeerId = encodePeerId(switch.peerInfo.peerId)
   echo base36PeerId
 
@@ -346,7 +359,7 @@ proc main() {.async: (raises: [Exception]).} =
   let domain = fmt"*.{baseDomain}"
 
   # request challenge from CA
-  let dns01Challenge = await account.requestChallenge(@[domain])
+  let (dns01Challenge, finalizeURL) = await account.requestChallenge(@[domain])
   echo fmt"challenge: {dns01Challenge}"
 
   let key = loadRsaKey(account.privKey)
@@ -399,8 +412,31 @@ proc main() {.async: (raises: [Exception]).} =
         echo checkBody
         chalCompleted = true
 
+  # finalize the request
+  var certKey: cert_key_t
+  var certCtx: cert_context_t
+  let randomCstring = urandomToCString(256)
+  if cert_init_drbg(randomCstring, 256, certCtx.addr) != CERT_SUCCESS:
+    echo fmt"error initializing context"
+    quit(1)
+  if cert_generate_key(certCtx, certKey.addr) != CERT_SUCCESS:
+    echo fmt"error generating key"
+    quit(1)
+  var derCSR: ptr cert_buffer = nil
 
-  # get certificate for domain
+  let requestingDomainCstr = (fmt"*.{baseDomain}").cstring
+  echo requestingDomainCstr
+  let errCode = cert_signing_req(requestingDomainCstr, certKey, derCSR.addr)
+  echo fmt"here3: error code: {errCode}"
+  # TODO: convert dercsr to bytes (toseq does not work)
+  let b64CSR = base64UrlEncodeNoSuffix(derCSR.toSeq)
+  var certFinalized = false
+  while (not certFinalized):
+    let finalizedResp = await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
+    let finalizedBody = bytesToString(await finalizedResp.getBodyBytes()).parseJson()
+    echo finalizedBody
+    if finalizedBody["status"].getStr != "processing":
+      certFinalized = true
 
   await switch.stop()
 
