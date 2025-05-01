@@ -168,7 +168,7 @@ proc registerAccount(acc: Account) {.async raises: [Exception].} =
   acc.status = account.status
   acc.contact = account.contact
 
-proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, string)] {.async.} =
+proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, string, string)] {.async.} =
   var orderPayload = %*{"identifiers": []}
   for domain in domains:
     orderPayload["identifiers"].add(%*{"type": "dns", "value": domain})
@@ -177,6 +177,8 @@ proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, str
 
   let respBody = bytesToString(await resp.getBodyBytes()).parseJson()
   echo respBody
+  let orderURL = resp.headers.getString("location")
+  echo "Order URLR: " & orderURL
   let finalizeURL = respBody["finalize"].getStr
 
   # get challenges
@@ -193,7 +195,7 @@ proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, str
       break
 
   # TODO: error dns01 not found
-  return (dns01, finalizeURL)
+  return (dns01, finalizeURL, orderURL)
 
 proc newAccount(): Account =
   var account: Account
@@ -359,7 +361,7 @@ proc main() {.async: (raises: [Exception]).} =
   let domain = fmt"*.{baseDomain}"
 
   # request challenge from CA
-  let (dns01Challenge, finalizeURL) = await account.requestChallenge(@[domain])
+  let (dns01Challenge, finalizeURL, orderURL) = await account.requestChallenge(@[domain])
   echo fmt"challenge: {dns01Challenge}"
 
   let key = loadRsaKey(account.privKey)
@@ -430,14 +432,26 @@ proc main() {.async: (raises: [Exception]).} =
   echo fmt"here3: error code: {errCode}"
   # TODO: convert dercsr to bytes (toseq does not work)
   let b64CSR = base64UrlEncodeNoSuffix(derCSR.toSeq)
+  let finalizedResp = await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
+  let finalizedBody = bytesToString(await finalizedResp.getBodyBytes())
+  echo finalizedBody
+
   var certFinalized = false
   while (not certFinalized):
-    let finalizedResp = await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
-    let finalizedBody = bytesToString(await finalizedResp.getBodyBytes()).parseJson()
-    echo finalizedBody
-    if finalizedBody["status"].getStr != "processing":
-      certFinalized = true
+    let finalizedResp = await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
+    let finalizedBody = bytesToString(await finalizedResp.getBodyBytes())
+    let finalizedJson = finalizedBody.parseJson()
+    if finalizedJson["status"].getStr != "processing":
+        echo finalizedBody
+        certFinalized = true
 
+
+  let downloadResp = await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
+  let certDownloadURL = bytesToString(await downloadResp.getBodyBytes()).parseJson()["certificate"].getStr
+
+  let certificateResp = await HttpClientRequestRef.get(HttpSessionRef.new(), certDownloadURL).get().send()
+  let certificateRespBody = bytesToString(await certificateResp.getBodyBytes())
+  echo certificateRespBody
   await switch.stop()
 
 waitFor(main())
