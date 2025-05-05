@@ -4,6 +4,7 @@
 import std/[base64, options, os, strformat, osproc, random, strutils, json, net]
 import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
 import libp2p/transports/tls/certificate_ffi
+import libp2p/crypto
 import libp2p/transports/tls/certificate
 import std/sysrand
 import chronos/apps/http/httpclient
@@ -17,15 +18,12 @@ const
 type Account = ref object
   status*: string
   contact*: seq[string]
-  privKey: string
+  privKey: RsaPrivateKey
   kid*: string
 
 type SigParam = object
   k: string
   v: seq[byte]
-
-type RSAPrivateKey = object
-  n, e, d, p, q, dmp1, dmq1, iqmp: seq[byte]
 
 proc base64UrlEncode(data: seq[byte]): string =
   ## Encodes data using base64url (RFC 4648 §5) — no padding, URL-safe
@@ -43,7 +41,7 @@ proc genTempFilename(prefix: string, suffix: string): string =
   let randomPart = rand(1_000_000).intToStr()
   result = fmt"{tempDir}/{prefix}{randomPart}{suffix}"
 
-proc loadRsaKey*(pemData: string): RSAPrivateKey =
+proc loadRsaKey*(pemData: string): RsaPrivateKey =
   ## Loads an RSA private key from PEM-encoded string data.
   ##
   ## Parameters:
@@ -110,7 +108,10 @@ proc generateRsaKey*(bits = 2048): string =
   removeFile(tmpFile)
 
 proc getDirectory(): Future[JsonNode] {.async.} =
-  let resp = await HttpClientRequestRef.get(HttpSessionRef.new(), LetsEncryptURL & "/directory").get().send()
+  let resp = await HttpClientRequestRef
+  .get(HttpSessionRef.new(), LetsEncryptURL & "/directory")
+  .get()
+  .send()
   let resp_body = bytesToString(await resp.getBodyBytes())
   let directory = resp_body.parseJson()
   return directory
@@ -154,10 +155,17 @@ proc makeSignedAcmeRequest(
       "signature": base64UrlEncode(token.signature),
     }
 
-  return await HttpClientRequestRef.post(HttpSessionRef.new(), url, body = $body, headers = [("Content-Type", "application/jose+json")]).get().send()
+  return await HttpClientRequestRef
+  .post(
+    HttpSessionRef.new(),
+    url,
+    body = $body,
+    headers = [("Content-Type", "application/jose+json")],
+  )
+  .get()
+  .send()
 
-
-proc registerAccount(acc: Account) {.async raises: [Exception].} =
+proc registerAccount(acc: Account) {.async, raises: [Exception].} =
   let registerAccountPayload = %*{"termsOfServiceAgreed": true}
   let directory = await getDirectory()
   let resp = await acc.makeSignedAcmeRequest(
@@ -168,7 +176,9 @@ proc registerAccount(acc: Account) {.async raises: [Exception].} =
   acc.status = account.status
   acc.contact = account.contact
 
-proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, string, string)] {.async.} =
+proc requestChallenge(
+    acc: Account, domains: seq[string]
+): Future[(JsonNode, string, string)] {.async.} =
   var orderPayload = %*{"identifiers": []}
   for domain in domains:
     orderPayload["identifiers"].add(%*{"type": "dns", "value": domain})
@@ -183,7 +193,8 @@ proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, str
 
   # get challenges
   let authz_url = respBody["authorizations"][0].getStr
-  let auth_resp = await HttpClientRequestRef.get(HttpSessionRef.new(), authz_url).get().send()
+  let auth_resp =
+    await HttpClientRequestRef.get(HttpSessionRef.new(), authz_url).get().send()
   let authz = bytesToString(await auth_resp.getBodyBytes()).parseJson()
 
   let challenges = authz["challenges"]
@@ -197,10 +208,11 @@ proc requestChallenge(acc: Account, domains: seq[string]): Future[(JsonNode, str
   # TODO: error dns01 not found
   return (dns01, finalizeURL, orderURL)
 
-proc newAccount(): Account =
+proc newAccount(privKey: RsaPrivateKey): Account =
   var account: Account
   new(account)
-  account.privKey = generateRsaKey()
+  let rng = newRng()
+  account.privKey = privKey
   return account
 
 proc thumbprint(key: RSAPrivateKey): string =
@@ -275,7 +287,8 @@ proc peerIDAuth(
 ): Future[string] {.async.} =
   let registrationURL = fmt"{AutoTLSBroker}/v1/_acme-challenge"
 
-  let resp1 = await HttpClientRequestRef.get(HttpSessionRef.new(), registrationURL).get().send()
+  let resp1 =
+    await HttpClientRequestRef.get(HttpSessionRef.new(), registrationURL).get().send()
 
   let wwwAuthenticate = resp1.headers.getString("www-authenticate")
 
@@ -300,12 +313,19 @@ proc peerIDAuth(
   echo "3.AUTHORIZATION"
   echo authHeader
 
-  let resp = await HttpClientRequestRef.post(HttpSessionRef.new(), registrationURL, body = $payload, headers = [
+  let resp = await HttpClientRequestRef
+  .post(
+    HttpSessionRef.new(),
+    registrationURL,
+    body = $payload,
+    headers = [
       ("Content-Type", "application/json"),
       ("User-Agent", "nim-libp2p"),
       ("authorization", authHeader),
     ],
-  ).get().send()
+  )
+  .get()
+  .send()
 
   echo "4.SERVER BEARER"
   echo resp.status
@@ -317,22 +337,24 @@ proc peerIDAuth(
 proc encodePeerId(peerId: PeerId): string =
   var mh: MultiHash
   if MultiHash.decode(peerId.data, mh).get() == -1:
-      echo "error! wrong multihash"
-      quit(1)
+    echo "error! wrong multihash"
+    quit(1)
   # cidv1 from multihash with libp2pkey codec
   let cid = Cid.init(CIDv1, multiCodec("libp2p-key"), mh).get()
   return Base36.encode(cid.data.buffer)
 
 proc urandomToCString(len: int): cstring =
   let randBytes = urandom(len)
-  result = cast[cstring](alloc(len + 1))  # +1 for null terminator
-  for i in 0..<len:
+  result = cast[cstring](alloc(len + 1)) # +1 for null terminator
+  for i in 0 ..< len:
     result[i] = char(randBytes[i])
-  result[len] = '\0'  # Null-terminate
+  result[len] = '\0' # Null-terminate
 
 proc main() {.async: (raises: [Exception]).} =
   # if key file does not exist, register account
   let keyFile = "/tmp/account.key"
+  let rng = newRng()
+  let privKey = RsaPrivateKey.random(rng).get() # TODO: fix
   var account: Account = newAccount()
   if fileExists(keyFile):
     account.privKey = readFile(keyFile)
@@ -342,7 +364,6 @@ proc main() {.async: (raises: [Exception]).} =
   # registering account with key already present returns account
 
   # start libp2p peer
-  let rng = newRng()
   let switch = SwitchBuilder
     .new()
     .withRng(rng)
@@ -361,7 +382,8 @@ proc main() {.async: (raises: [Exception]).} =
   let domain = fmt"*.{baseDomain}"
 
   # request challenge from CA
-  let (dns01Challenge, finalizeURL, orderURL) = await account.requestChallenge(@[domain])
+  let (dns01Challenge, finalizeURL, orderURL) =
+    await account.requestChallenge(@[domain])
   echo fmt"challenge: {dns01Challenge}"
 
   let key = loadRsaKey(account.privKey)
@@ -383,8 +405,7 @@ proc main() {.async: (raises: [Exception]).} =
   # authenticate as peerID with AutoTLS broker and send challenge
   # https://github.com/libp2p/specs/blob/master/http/peer-id-auth.md
   let bearerToken = await peerIDAuth(
-    base36PeerId, switch.peerInfo.privateKey, switch.peerInfo.publicKey,
-    payload,
+    base36PeerId, switch.peerInfo.privateKey, switch.peerInfo.publicKey, payload
   )
   discard bearerToken
 
@@ -407,12 +428,13 @@ proc main() {.async: (raises: [Exception]).} =
   let checkURL = completedBody["url"].getStr
   var chalCompleted = false
   while (not chalCompleted):
-    let checkResp = await HttpClientRequestRef.get(HttpSessionRef.new(), checkURL).get().send()
+    let checkResp =
+      await HttpClientRequestRef.get(HttpSessionRef.new(), checkURL).get().send()
     let checkBody = bytesToString(await checkResp.getBodyBytes())
     let checkJson = checkBody.parseJson()
     if checkJson["status"].getStr != "pending":
-        echo checkBody
-        chalCompleted = true
+      echo checkBody
+      chalCompleted = true
 
   # finalize the request
   var certKey: cert_key_t
@@ -432,24 +454,28 @@ proc main() {.async: (raises: [Exception]).} =
   echo fmt"here3: error code: {errCode}"
   # TODO: convert dercsr to bytes (toseq does not work)
   let b64CSR = base64UrlEncodeNoSuffix(derCSR.toSeq)
-  let finalizedResp = await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
+  let finalizedResp =
+    await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
   let finalizedBody = bytesToString(await finalizedResp.getBodyBytes())
   echo finalizedBody
 
   var certFinalized = false
   while (not certFinalized):
-    let finalizedResp = await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
+    let finalizedResp =
+      await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
     let finalizedBody = bytesToString(await finalizedResp.getBodyBytes())
     let finalizedJson = finalizedBody.parseJson()
     if finalizedJson["status"].getStr != "processing":
-        echo finalizedBody
-        certFinalized = true
+      echo finalizedBody
+      certFinalized = true
 
+  let downloadResp =
+    await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
+  let certDownloadURL =
+    bytesToString(await downloadResp.getBodyBytes()).parseJson()["certificate"].getStr
 
-  let downloadResp = await HttpClientRequestRef.get(HttpSessionRef.new(), orderURL).get().send()
-  let certDownloadURL = bytesToString(await downloadResp.getBodyBytes()).parseJson()["certificate"].getStr
-
-  let certificateResp = await HttpClientRequestRef.get(HttpSessionRef.new(), certDownloadURL).get().send()
+  let certificateResp =
+    await HttpClientRequestRef.get(HttpSessionRef.new(), certDownloadURL).get().send()
   let certificateRespBody = bytesToString(await certificateResp.getBodyBytes())
   echo certificateRespBody
   await switch.stop()
