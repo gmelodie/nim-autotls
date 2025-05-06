@@ -1,8 +1,8 @@
 # run with:
 # nim c -d:ssl -r acme.nim
 
-import base64, options, os, strformat, osproc, random, strutils, json, net, sequtils
-import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
+import base64, options, strformat, osproc, random, strutils, json, net
+import chronos, bio, jwt, nimcrypto, libp2p, stew/base36
 import libp2p/transports/tls/certificate_ffi
 import libp2p/transports/tls/certificate
 import libp2p/crypto/rsa
@@ -31,12 +31,6 @@ proc base64UrlEncode(data: seq[byte]): string =
   result = base64.encode(data, safe = true)
   result.removeSuffix("=")
   result.removeSuffix("=")
-
-proc genTempFilename(prefix: string, suffix: string): string =
-  ## Generates a unique temporary file name with the given prefix and suffix.
-  let tempDir = getTempDir()
-  let randomPart = rand(1_000_000).intToStr()
-  result = fmt"{tempDir}/{prefix}{randomPart}{suffix}"
 
 proc getDirectory(): Future[JsonNode] {.async.} =
   let resp = await HttpClientRequestRef
@@ -103,14 +97,10 @@ proc registerAccount(acc: Account) {.async: (raises: [Exception]).} =
   let resp = await acc.makeSignedAcmeRequest(
     directory["newAccount"].getStr, registerAccountPayload, needsJwk = true
   )
-  let jsonResp = bytesToString(await resp.getBodyBytes()) # TODO: fix
+  let jsonResp = bytesToString(await resp.getBodyBytes()).parseJson()
   echo jsonResp
-  var account: Account
-  new(account)
-  # var account = bytesToString(await resp.getBodyBytes()).fromJson(Account)
   acc.kid = resp.headers.getString("location")
-  acc.status = account.status
-  acc.contact = account.contact
+  acc.status = jsonResp["status"].getStr
 
 proc requestChallenge(
     acc: Account, domains: seq[string]
