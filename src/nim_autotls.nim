@@ -1,11 +1,12 @@
 # run with:
 # nim c -d:ssl -r acme.nim
 
-import std/[base64, options, os, strformat, osproc, random, strutils, json, net]
+import base64, options, os, strformat, osproc, random, strutils, json, net, sequtils
 import chronos, bio, jwt, jsony, nimcrypto, libp2p, stew/base36
 import libp2p/transports/tls/certificate_ffi
-import libp2p/crypto
 import libp2p/transports/tls/certificate
+import libp2p/crypto/rsa
+import bearssl/pem
 import std/sysrand
 import chronos/apps/http/httpclient
 
@@ -18,7 +19,7 @@ const
 type Account = ref object
   status*: string
   contact*: seq[string]
-  privKey: RsaPrivateKey
+  key: KeyPair
   kid*: string
 
 type SigParam = object
@@ -31,81 +32,11 @@ proc base64UrlEncode(data: seq[byte]): string =
   result.removeSuffix("=")
   result.removeSuffix("=")
 
-proc base64UrlEncodeNoSuffix(data: seq[byte]): string =
-  ## Encodes data using base64url (RFC 4648 §5) — no padding, URL-safe
-  result = base64.encode(data, safe = true)
-
 proc genTempFilename(prefix: string, suffix: string): string =
   ## Generates a unique temporary file name with the given prefix and suffix.
   let tempDir = getTempDir()
   let randomPart = rand(1_000_000).intToStr()
   result = fmt"{tempDir}/{prefix}{randomPart}{suffix}"
-
-proc loadRsaKey*(pemData: string): RsaPrivateKey =
-  ## Loads an RSA private key from PEM-encoded string data.
-  ##
-  ## Parameters:
-  ##   - pemData: The PEM-encoded RSA private key.
-  ##
-  ## Returns:
-  ##   - An RSAPrivateKey object representing the loaded key.
-  let pemFile = genTempFilename("acme_key_", ".pem")
-  writeFile(pemFile, pemData)
-
-  var n, e, d, p, q, dmp1, dmq1, iqmp: seq[byte]
-  let modCmd = "openssl rsa -in " & pemFile & " -noout -modulus"
-  let (modOutput, modExitCode) = execCmdEx(modCmd)
-  if modExitCode == 0 and modOutput.startsWith("Modulus="):
-    let modHex = modOutput.splitLines()[0][8 ..^ 1]
-    n = newSeq[byte](modHex.len div 2)
-    for i in countup(0, modHex.len - 2, 2):
-      n[i div 2] = byte(parseHexInt(modHex[i .. i + 1]))
-
-  let textCmd = "openssl rsa -in " & pemFile & " -noout -text"
-  let (textOutput, textExitCode) = execCmdEx(textCmd)
-
-  if textExitCode != 0:
-    removeFile(pemFile)
-    raise newException(IOError, "Failed to load RSA private key: " & textOutput)
-
-  for line in textOutput.splitLines():
-    if line.contains("publicExponent:"):
-      let parts = line.split("(")
-      if parts.len > 1:
-        let exponentStr = parts[1].split(")")[0]
-        let expValue = parseHexInt(exponentStr.replace("0x", ""))
-        e = @[(expValue shr 16).byte, (expValue shr 8).byte, expValue.byte]
-      break
-
-  removeFile(pemFile)
-
-  result =
-    RSAPrivateKey(n: n, e: e, d: d, p: p, q: q, dmp1: dmp1, dmq1: dmq1, iqmp: iqmp)
-
-proc generateRsaKey*(bits = 2048): string =
-  ## Generates a new RSA private key with the specified bit size.
-  ##
-  ## Parameters:
-  ##   - bits: The RSA key size in bits. Default is 2048.
-  ##
-  ## Returns:
-  ##   - The generated RSA private key in PEM format.
-  ##
-  ## Example:
-  ##   ```nim
-  ##   let privateKey = generateRsaKey(4096) # Generate a 4096-bit RSA key
-  ##   writeFile("domain.key", privateKey)
-  ##   ```
-  let tmpFile = genTempFilename("acme_key_", ".pem")
-  let cmd = "openssl genrsa -out " & tmpFile & " " & $bits
-  let (output, exitCode) = execCmdEx(cmd)
-
-  if exitCode != 0:
-    raise newException(IOError, "Failed to generate RSA key: " & output)
-
-  result = readFile(tmpFile)
-  writeFile("/tmp/domain.key", result)
-  removeFile(tmpFile)
 
 proc getDirectory(): Future[JsonNode] {.async.} =
   let resp = await HttpClientRequestRef
@@ -123,16 +54,15 @@ proc getNewNonce(): Future[string] {.async.} =
   return resp.headers.getString("replay-nonce")
 
 proc getAcmeHeader(
-    acc: Account,
-    url: string,
-    needsJwk: bool,
-    n: string = "",
-    e: string = "",
-    kid: string = "",
+    acc: Account, url: string, needsJwk: bool, kid: string = ""
 ): Future[JsonNode] {.async.} =
-  let key = loadRsaKey(acc.privKey)
-  let n = base64UrlEncode(key.n)
-  let e = base64UrlEncode(key.e)
+  # TODO: check if scheme is RSA
+  let pubkey = acc.key.pubkey.rsakey
+  let nArray = @(getArray(pubkey.buffer, pubkey.key.n, pubkey.key.nlen))
+  let eArray = @(getArray(pubkey.buffer, pubkey.key.e, pubkey.key.elen))
+  let n = base64UrlEncode(nArray)
+  let e = base64UrlEncode(eArray)
+
   let newNonce = await getNewNonce()
   var header = %*{"alg": Alg, "typ": "JWT", "nonce": newNonce, "url": url}
   if needsJwk:
@@ -146,7 +76,9 @@ proc makeSignedAcmeRequest(
 ): Future[HttpClientResponseRef] {.async.} =
   let acmeHeader = await acc.getAcmeHeader(url, needsJwk)
   var token = toJWT(%*{"header": acmeHeader, "claims": payload})
-  token.sign(acc.privKey)
+  let derPrivKey = acc.key.seckey.rsakey.getBytes.get
+  let pemPrivKey: string = pemEncode(derPrivKey, "PRIVATE KEY")
+  token.sign(pemPrivKey) # TODO: fix
 
   let body =
     %*{
@@ -165,13 +97,17 @@ proc makeSignedAcmeRequest(
   .get()
   .send()
 
-proc registerAccount(acc: Account) {.async, raises: [Exception].} =
+proc registerAccount(acc: Account) {.async: (raises: [Exception]).} =
   let registerAccountPayload = %*{"termsOfServiceAgreed": true}
   let directory = await getDirectory()
   let resp = await acc.makeSignedAcmeRequest(
     directory["newAccount"].getStr, registerAccountPayload, needsJwk = true
   )
-  var account = bytesToString(await resp.getBodyBytes()).fromJson(Account)
+  let jsonResp = bytesToString(await resp.getBodyBytes()) # TODO: fix
+  echo jsonResp
+  var account: Account
+  new(account)
+  # var account = bytesToString(await resp.getBodyBytes()).fromJson(Account)
   acc.kid = resp.headers.getString("location")
   acc.status = account.status
   acc.contact = account.contact
@@ -208,16 +144,20 @@ proc requestChallenge(
   # TODO: error dns01 not found
   return (dns01, finalizeURL, orderURL)
 
-proc newAccount(privKey: RsaPrivateKey): Account =
+proc newAccount(key: KeyPair): Account =
   var account: Account
   new(account)
-  let rng = newRng()
-  account.privKey = privKey
+  account.key = key
   return account
 
-proc thumbprint(key: RSAPrivateKey): string =
-  let n = base64UrlEncode(key.n)
-  let e = base64UrlEncode(key.e)
+proc thumbprint(key: KeyPair): string =
+  # TODO: check if scheme is RSA
+  let pubkey = key.pubkey.rsakey
+  let nArray = @(getArray(pubkey.buffer, pubkey.key.n, pubkey.key.nlen))
+  let eArray = @(getArray(pubkey.buffer, pubkey.key.e, pubkey.key.elen))
+
+  let n = base64UrlEncode(nArray)
+  let e = base64UrlEncode(eArray)
   let keyJson = %*{"e": e, "kty": "RSA", "n": n}
   # TODO: https://www.rfc-editor.org/rfc/rfc7638
   let digest = sha256.digest($keyJson)
@@ -280,7 +220,7 @@ proc peerIdSign(
         SigParam(k: "hostname", v: hostname.toByteSeq),
       ]
   let bytesToSign = genDataToSign(prefix, parts)
-  result = base64UrlEncodeNoSuffix(privateKey.sign(bytesToSign).get().getBytes())
+  return base64.encode(privateKey.sign(bytesToSign).get().getBytes(), safe = true)
 
 proc peerIDAuth(
     peerID: string, privateKey: PrivateKey, pubKey: PublicKey, payload: JsonNode
@@ -302,7 +242,7 @@ proc peerIDAuth(
   echo "challenge-client: ", challengeClient
   echo "server-public-key: ", $serverPublicKey
   echo "opaque: ", opaque
-  let clientPubKeyB64 = base64UrlEncodeNoSuffix(pubKey.getBytes().get())
+  let clientPubKeyB64 = base64.encode(pubKey.getBytes().get(), safe = true)
   let challengeServer = randomChallenge()
   let sig = peerIdSign(privateKey, challengeClient, serverPublicKey, hostname)
 
@@ -353,13 +293,9 @@ proc urandomToCString(len: int): cstring =
 proc main() {.async: (raises: [Exception]).} =
   # if key file does not exist, register account
   let keyFile = "/tmp/account.key"
-  let rng = newRng()
-  let privKey = RsaPrivateKey.random(rng).get() # TODO: fix
-  var account: Account = newAccount()
-  if fileExists(keyFile):
-    account.privKey = readFile(keyFile)
-  else:
-    writeFile(keyFile, account.privKey)
+  var rng = newRng()
+  let key = KeyPair.random(PKScheme.RSA, rng[]).get()
+  var account: Account = newAccount(key)
   await account.registerAccount()
   # registering account with key already present returns account
 
@@ -386,11 +322,11 @@ proc main() {.async: (raises: [Exception]).} =
     await account.requestChallenge(@[domain])
   echo fmt"challenge: {dns01Challenge}"
 
-  let key = loadRsaKey(account.privKey)
-
   let keyAuthorization = base64UrlEncode(
     @(
-      sha256.digest((dns01Challenge["token"].getStr & "." & thumbprint(key)).toByteSeq).data
+      sha256.digest(
+        (dns01Challenge["token"].getStr & "." & thumbprint(account.key)).toByteSeq
+      ).data
     )
   )
   echo fmt"key authorization: {keyAuthorization}"
@@ -448,12 +384,10 @@ proc main() {.async: (raises: [Exception]).} =
     quit(1)
   var derCSR: ptr cert_buffer = nil
 
-  let requestingDomainCstr = (fmt"*.{baseDomain}").cstring
-  echo requestingDomainCstr
-  let errCode = cert_signing_req(requestingDomainCstr, certKey, derCSR.addr)
+  let errCode = cert_signing_req(domain.cstring, certKey, derCSR.addr)
   echo fmt"here3: error code: {errCode}"
   # TODO: convert dercsr to bytes (toseq does not work)
-  let b64CSR = base64UrlEncodeNoSuffix(derCSR.toSeq)
+  let b64CSR = base64.encode(derCSR.toSeq, safe = true)
   let finalizedResp =
     await account.makeSignedAcmeRequest(finalizeURL, %*{"csr": b64CSR})
   let finalizedBody = bytesToString(await finalizedResp.getBodyBytes())
